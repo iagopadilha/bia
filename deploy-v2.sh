@@ -49,53 +49,67 @@ case "$ACTION_CHOICE" in
     aws ecr get-login-password --region "$REGION" \
       | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 
-    docker build -t "$ECR_REPO:latest" -t "$ECR_REPO:$IMAGE_TAG" "$(dirname "$0")"
+    docker build -t "$ECR_REPO:$IMAGE_TAG" -t "$ECR_REPO:latest" "$(dirname "$0")"
 
-    docker push "$ECR_REPO:latest"
     docker push "$ECR_REPO:$IMAGE_TAG"
-    echo "→ Push concluído: $ECR_REPO:$IMAGE_TAG"
+    docker push "$ECR_REPO:latest"
+    echo "→ Push concluído: $ECR_REPO:$IMAGE_TAG (+ latest)"
     ;;
   2)
-    # Listar tags disponíveis no ECR
+    # Listar revisões da task def com a imagem que cada uma usa
     echo ""
-    echo "=== TAGS DISPONÍVEIS NO ECR ==="
-    mapfile -t TAGS < <(aws ecr describe-images \
-      --repository-name bia \
+    echo "=== REVISÕES DISPONÍVEIS ($TASK_FAMILY) ==="
+    mapfile -t REVISIONS < <(aws ecs list-task-definitions \
+      --family-prefix "$TASK_FAMILY" \
       --region "$REGION" \
-      --query 'sort_by(imageDetails, &imagePushedAt)[*].imageTags[0]' \
-      --output text | tr '\t' '\n' | grep -v '^None$' | grep -v '^latest$' | tac)
+      --sort DESC \
+      --query 'taskDefinitionArns[]' \
+      --output text | tr '\t' '\n')
 
-    if [ ${#TAGS[@]} -eq 0 ]; then
-      echo "Nenhuma tag encontrada no ECR."; exit 1
+    if [ ${#REVISIONS[@]} -eq 0 ]; then
+      echo "Nenhuma revisão encontrada."; exit 1
     fi
 
-    for i in "${!TAGS[@]}"; do
-      echo "[$((i+1))] ${TAGS[$i]}"
+    for i in "${!REVISIONS[@]}"; do
+      REV_ARN="${REVISIONS[$i]}"
+      REV_IMAGE=$(aws ecs describe-task-definition \
+        --task-definition "$REV_ARN" \
+        --region "$REGION" \
+        --query 'taskDefinition.containerDefinitions[0].image' \
+        --output text)
+      REV_NUM=$(echo "$REV_ARN" | grep -oE '[0-9]+$')
+      echo "[$((i+1))] revisão $REV_NUM → $REV_IMAGE"
     done
 
-    read -rp "Escolha a tag para rollback [1-${#TAGS[@]}]: " TAG_CHOICE
-    IMAGE_TAG="${TAGS[$((TAG_CHOICE-1))]}"
+    read -rp "Escolha a revisão para rollback [1-${#REVISIONS[@]}]: " TAG_CHOICE
+    ROLLBACK_ARN="${REVISIONS[$((TAG_CHOICE-1))]}"
 
-    if [ -z "$IMAGE_TAG" ]; then
-      echo "Tag inválida."; exit 1
+    if [ -z "$ROLLBACK_ARN" ]; then
+      echo "Opção inválida."; exit 1
     fi
-    echo "→ Tag selecionada: $IMAGE_TAG"
+
+    ROLLBACK_REV=$(echo "$ROLLBACK_ARN" | grep -oE '[0-9]+$')
+    echo "→ Revisão selecionada: $TASK_FAMILY:$ROLLBACK_REV"
+
+    # No rollback, reutiliza a revisão existente diretamente (sem criar nova)
+    NEW_REVISION="$ROLLBACK_REV"
     ;;
   *)
     echo "Opção inválida."; exit 1 ;;
 esac
 
-# ─── 3. Registrar nova task definition ───────────────────────────────────────
-echo ""
-echo "=== REGISTRANDO TASK DEFINITION ==="
+# ─── 3. Registrar nova task definition (apenas no build+deploy) ───────────────
+if [ "$ACTION_CHOICE" = "1" ]; then
+  echo ""
+  echo "=== REGISTRANDO TASK DEFINITION ==="
 
-CURRENT_TASK_DEF=$(aws ecs describe-task-definition \
-  --task-definition "$TASK_FAMILY" \
-  --region "$REGION" \
-  --query 'taskDefinition' \
-  --output json)
+  CURRENT_TASK_DEF=$(aws ecs describe-task-definition \
+    --task-definition "$TASK_FAMILY" \
+    --region "$REGION" \
+    --query 'taskDefinition' \
+    --output json)
 
-NEW_TASK_DEF=$(echo "$CURRENT_TASK_DEF" | python3 -c "
+  NEW_TASK_DEF=$(echo "$CURRENT_TASK_DEF" | python3 -c "
 import json, sys
 td = json.load(sys.stdin)
 td['containerDefinitions'][0]['image'] = '$ECR_REPO:$IMAGE_TAG'
@@ -105,13 +119,14 @@ for key in ['taskDefinitionArn','revision','status','requiresAttributes',
 print(json.dumps(td))
 ")
 
-NEW_REVISION=$(aws ecs register-task-definition \
-  --region "$REGION" \
-  --cli-input-json "$NEW_TASK_DEF" \
-  --query 'taskDefinition.revision' \
-  --output text)
+  NEW_REVISION=$(aws ecs register-task-definition \
+    --region "$REGION" \
+    --cli-input-json "$NEW_TASK_DEF" \
+    --query 'taskDefinition.revision' \
+    --output text)
 
-echo "→ Registrada: $TASK_FAMILY:$NEW_REVISION (imagem: $ECR_REPO:$IMAGE_TAG)"
+  echo "→ Registrada: $TASK_FAMILY:$NEW_REVISION (imagem: $ECR_REPO:$IMAGE_TAG)"
+fi
 
 # ─── 4. Deploy no ECS ─────────────────────────────────────────────────────────
 echo ""
@@ -136,9 +151,15 @@ aws ecs wait services-stable \
   --services "$SERVICE" \
   --region "$REGION"
 
+FINAL_IMAGE=$(aws ecs describe-task-definition \
+  --task-definition "$TASK_FAMILY:$NEW_REVISION" \
+  --region "$REGION" \
+  --query 'taskDefinition.containerDefinitions[0].image' \
+  --output text)
+
 echo ""
 echo "✅ Deploy concluído!"
 echo "   Ambiente : $CLUSTER"
 echo "   Service  : $SERVICE"
 echo "   Task Def : $TASK_FAMILY:$NEW_REVISION"
-echo "   Imagem   : $ECR_REPO:$IMAGE_TAG"
+echo "   Imagem   : $FINAL_IMAGE"
