@@ -59,7 +59,7 @@ const AddTask = ({ onAdd }) => {
       </div>
       
       <button type="submit" className="btn btn-block success">
-        Adicionar tarefa gugu yeye let the world explide
+        Adicionar versao para rollback
       </button>
       
       <Modal
