@@ -17,7 +17,7 @@ RUN cd client && npm install --legacy-peer-deps --loglevel=error
 # Copiar todos os arquivos
 COPY . .
 
-# Build do front-end com Vite changing
+# Build do front-end com Vite changing a
 RUN cd client && VITE_API_URL=http://bia-alb-694607114.us-east-1.elb.amazonaws.com npm run build
 
 # Limpeza das dependências de desenvolvimento do client para reduzir tamanho
